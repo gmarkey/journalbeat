@@ -27,18 +27,30 @@ import (
 	"github.com/mheese/go-systemd/sdjournal"
 )
 
+var SeekPositions = map[string]bool{
+	"cursor": true,
+	"head":   true,
+	"tail":   true,
+}
+
+var SeekFallbackPositions = map[string]bool{
+	"none": true,
+	"head": true,
+	"tail": true,
+}
+
 // Journalbeat is the main Journalbeat struct
 type Journalbeat struct {
 	JbConfig             ConfigSettings
 	writeCursorState     bool
 	cursorStateFile      string
 	cursorFlushSecs      int
-	seekToCursor         bool
-	seekToHead           bool
-	seekToTail           bool
+	seekPosition         string
+	cursorSeekFallback   string
 	convertToNumbers     bool
 	cleanFieldnames      bool
 	moveMetadataLocation string
+	fieldsDest           string
 	fields               common.MapStr
 
 	jr   *sdjournal.JournalReader
@@ -84,22 +96,16 @@ func (jb *Journalbeat) Config(b *beat.Beat) error {
 		jb.cursorFlushSecs = 5
 	}
 
-	if jb.JbConfig.Input.SeekToCursor != nil {
-		jb.seekToCursor = *jb.JbConfig.Input.SeekToCursor
+	if jb.JbConfig.Input.SeekPosition != nil {
+		jb.seekPosition = *jb.JbConfig.Input.SeekPosition
 	} else {
-		jb.seekToCursor = false
+		jb.seekPosition = "tail"
 	}
 
-	if jb.JbConfig.Input.SeekToHead != nil {
-		jb.seekToHead = *jb.JbConfig.Input.SeekToHead
+	if jb.JbConfig.Input.CursorSeekFallback != nil {
+		jb.cursorSeekFallback = *jb.JbConfig.Input.CursorSeekFallback
 	} else {
-		jb.seekToHead = false
-	}
-
-	if jb.JbConfig.Input.SeekToTail != nil {
-		jb.seekToTail = *jb.JbConfig.Input.SeekToTail
-	} else {
-		jb.seekToTail = true
+		jb.cursorSeekFallback = "tail"
 	}
 
 	if jb.JbConfig.Input.ConvertToNumbers != nil {
@@ -120,71 +126,76 @@ func (jb *Journalbeat) Config(b *beat.Beat) error {
 		jb.moveMetadataLocation = ""
 	}
 
+	if jb.JbConfig.Input.FieldsDest != nil {
+		jb.fieldsDest = *jb.JbConfig.Input.FieldsDest
+	} else {
+		jb.fieldsDest = ""
+	}
+
 	if jb.JbConfig.Input.Fields != nil {
 		jb.fields = *jb.JbConfig.Input.Fields
 	}
 
-	if !jb.seekToCursor && !jb.seekToHead && !jb.seekToTail {
-		errMsg := "Either seek_to_cursor, seek_to_head or seek_to_tail need to be true"
+	if _, ok := SeekPositions[jb.seekPosition]; !ok {
+		errMsg := "seek_position must be either cursor, head, or tail"
 		logp.Err(errMsg)
 		return fmt.Errorf("%s", errMsg)
 	}
+
+	if _, ok := SeekFallbackPositions[jb.cursorSeekFallback]; !ok {
+		errMsg := "cursor_seek_fallback must be either head, tail, or none"
+		logp.Err(errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
+
 	return nil
 }
 
 func (jb *Journalbeat) seekToPosition() error {
-	var err error
+	position := jb.seekPosition
 	// try seekToCursor first, if that is requested
-	if jb.seekToCursor {
-		cursor, err2 := ioutil.ReadFile(jb.cursorStateFile)
+	if position == "cursor" {
+		cursor, err := ioutil.ReadFile(jb.cursorStateFile)
 		if err != nil {
-			err = fmt.Errorf("reading cursor state file failed: %v", err2)
-			logp.Err("Could not seek to cursor: %v", err)
+			logp.Warn("Could not seek to cursor: reading cursor state file failed: %v", err)
 		} else {
-			// try to seek to cursor
-			err2 = jb.jr.Journal.SeekCursor(string(cursor))
-			if err2 != nil {
-				err = fmt.Errorf("seek to cursor failed: %v", err2)
-				logp.Err("Could not seek to cursor: %v", err)
-			} else {
-				// seeking successful, return
-				logp.Info("Seek to cursor successful")
+			// try to seek to cursor and if successful return
+			err = seekToHelper("cursor", jb.jr.Journal.SeekCursor(string(cursor)))
+			if err == nil {
 				return nil
 			}
 		}
-	}
 
-	if jb.seekToHead {
-		err2 := jb.jr.Journal.SeekHead()
-		if err2 != nil {
-			err = fmt.Errorf("seek to head failed: %v", err2)
-			logp.Err("Could not seek to head: %v", err)
-		} else {
-			// seeking successful, return
-			logp.Info("Seek to head successful")
-			return nil
+		if jb.cursorSeekFallback == "none" {
+			return err
 		}
+
+		position = jb.cursorSeekFallback
 	}
 
-	if jb.seekToTail {
-		err2 := jb.jr.Journal.SeekTail()
-		if err2 != nil {
-			err = fmt.Errorf("seek to tail failed: %v", err2)
-			logp.Err("Could not seek to tail: %v", err)
-		} else {
-			// seeking successful, return
-			logp.Info("Seek to tail successful")
-			return nil
-		}
+	var err error
+	switch position {
+	case "head":
+		err = seekToHelper("head", jb.jr.Journal.SeekHead())
+	case "tail":
+		err = seekToHelper("tail", jb.jr.Journal.SeekTail())
 	}
+	return err
+}
 
+func seekToHelper(position string, err error) error {
+	if err == nil {
+		logp.Info("Seek to " + position + " successful")
+	} else {
+		logp.Warn("Could not seek to %s: %v", position, err)
+	}
 	return err
 }
 
 // Setup prepares Journalbeat for the main loop (starts journalreader, etc.)
 func (jb *Journalbeat) Setup(b *beat.Beat) error {
 	logp.Info("Journalbeat Setup")
-	jb.output = b.Events
+	jb.output = b.Publisher.Connect()
 	jb.done = make(chan int)
 	jb.recv = make(chan sdjournal.JournalEntry)
 	jb.cursorChan = make(chan string)
@@ -217,7 +228,9 @@ func (jb *Journalbeat) Setup(b *beat.Beat) error {
 func (jb *Journalbeat) Cleanup(b *beat.Beat) error {
 	logp.Info("Journalbeat Cleanup")
 	jb.jr.Close()
-	jb.cursorChanFlush <- 1
+	if jb.writeCursorState {
+		jb.cursorChanFlush <- 1
+	}
 	close(jb.done)
 	close(jb.recv)
 	close(jb.cursorChan)
@@ -270,7 +283,26 @@ func Publish(beat *beat.Beat, jb *Journalbeat) {
 
 		// add arbitrary fields.
 		if jb.fields != nil {
-			m["fields"] = jb.fields
+			fieldsMap := MapStrMoveMapToLocation(jb.fields, jb.fieldsDest)
+
+			// NOTE: this will overwrite everything at the location
+			for k, v := range fieldsMap {
+				m[k] = v
+			}
+		}
+
+		// add type if it does not exist yet (or if it is not a string)
+		// TODO: type should be derived from the system journal
+		_, ok := m["type"].(string)
+		if !ok {
+			m["type"] = "unknown"
+		}
+
+		// add input_type if it does not exist yet (or if it is not a string)
+		// TODO: input_type should be derived from the system journal
+		_, ok = m["input_type"].(string)
+		if !ok {
+			m["input_type"] = "journal"
 		}
 
 		// publish the event now
